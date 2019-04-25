@@ -2,7 +2,9 @@
 
 [![Build Status](https://travis-ci.com/Michael-Tu/ChocoPyCompiler.svg?token=mGNinjpZsndTxTSax5FR&branch=master)](https://travis-ci.com/Michael-Tu/ChocoPyCompiler)
 
-This project is done as a part of UC Berkeley undergraduate compilers course: [CS164 Spring 2019](http://inst.eecs.berkeley.edu/~cs164/sp19/). It includes a fully functional ChocoPy compiler for
+This project is done as a part of UC Berkeley undergraduate compilers course: [CS164 Spring 2019](http://inst.eecs.berkeley.edu/~cs164/sp19/).
+
+It includes a fully functional ChocoPy compiler for
 - lexing and parsing of ChocoPy programs into an abstract syntax tree (AST)
 - semantic analysis and type checking of the program
 - RISC-V assembly code generation
@@ -11,7 +13,7 @@ This project is done as a part of UC Berkeley undergraduate compilers course: [C
 
 [ChocoPy](https://chocopy.org) is a restricted subset of Python 3, which can easily be compiled to a target such as RISC-V assembly code. The language is fully specified using formal grammar, typing rules, and operational semantics. It was designed by [Rohan Padhye](https://people.eecs.berkeley.edu/~rohanpadhye/) and [Koushik Sen](https://people.eecs.berkeley.edu/~ksen/?rnd=1556232605921), and recently updated by [Paul Hilfinger](https://www2.eecs.berkeley.edu/Faculty/Homepages/hilfinger.html).
 
-You can learn more in [ChocoPy language reference manual](chocopy_language_reference.pdf), or [ChocoPy implementation guide](chocopy_implementation_guide).
+You can learn more in [ChocoPy language reference manual](chocopy_language_reference.pdf), or [ChocoPy implementation guide](chocopy_implementation_guid.pdf).
 
 ## Build
 
@@ -28,7 +30,7 @@ This will compile and package the code into a **standalone, executable** JAR fil
 To run a ChocoPy (`.py`) program, run
 
 ```
-jar -jar compiler.jar --action sss --run /path/to/your_program.py
+java -jar compiler.jar --action sss --run /path/to/your_program.py
 ```
 
 _Instructions on more optional commands will be updated in README soon_
