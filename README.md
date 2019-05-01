@@ -30,7 +30,7 @@ This will compile and package the code into a **standalone, executable** JAR fil
 To run a ChocoPy (`.py`) program, run
 
 ```
-java -jar compiler.jar --action sss --run /path/to/your_program.py
+java -jar compiler.jar --execute /path/to/your_program.py
 ```
 
 _Instructions on more optional commands will be updated in README soon_
