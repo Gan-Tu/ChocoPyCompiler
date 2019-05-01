@@ -218,7 +218,7 @@ public class ChocoPy {
             this.printErrors(inputFileName, this.program.getErrorList());
         }
         // print result
-        if (!this.runFlag && this.dest != null) {
+        if (this.dest != null) {
             this.writeFile(this.dest, result);
         } else if (this.program == null || this.program != null && !this.program.hasErrors()) {
             System.out.println(result);
