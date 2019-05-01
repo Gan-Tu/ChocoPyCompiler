@@ -115,6 +115,7 @@ public class CodeGenImpl extends CodeGenBase {
         super.initAsmConstants();
         backend.defineSym(".__list_header_words__", 4);
         backend.defineSym(".__string_header_words__", 4);
+        backend.defineSym(".__dispatch_table_offset__", 8);
     }
 
     /**
@@ -555,6 +556,7 @@ public class CodeGenImpl extends CodeGenBase {
         @Override
         public Void analyze(MethodCallExpr methodCall) {
             MemberExpr method = methodCall.method;
+            Label nonNoneClassLabel = generateLocalLabel();
 
             if (method == null || method.object == null) {
                 return null;
@@ -564,11 +566,11 @@ public class CodeGenImpl extends CodeGenBase {
                 );
             }
 
-            ClassValueType methodType = (ClassValueType) method.object.getInferredType();
-            String className = methodType.className();
-            ClassInfo classInfo = (ClassInfo) globalSymbols.get(className);
+            ClassValueType staticObjType = (ClassValueType) method.object.getInferredType();
+            String staticClassName = staticObjType.className();
+            ClassInfo staticClassInfo = (ClassInfo) globalSymbols.get(staticClassName);
 
-            if (classInfo == null) {
+            if (staticClassInfo == null) {
                 throw new IllegalArgumentException(
                     "static analysis should ensure MethodCallExpr acts on existing objects"
                 );
@@ -577,12 +579,23 @@ public class CodeGenImpl extends CodeGenBase {
             // load address to object into A0
             methodCall.method.object.dispatch(this);
 
+            // check against None
+            backend.emitBNEZ(A0, nonNoneClassLabel, "Ensure object reference is not None");
+            backend.emitJ(errorNone, "Cannot call methods on NONE object instance");
+            backend.emitLocalLabel(nonNoneClassLabel, "Proceed if the object is not None.");
+
             // get method's information
             String methodName = method.member.name;
-            int methodInfoIndex = classInfo.getMethodIndex(methodName);
-            FuncInfo methodInfo = classInfo.getMethods().get(methodInfoIndex);
+            int staticMethodIndex = staticClassInfo.getMethodIndex(methodName);
+            FuncInfo staticMethodInfo = staticClassInfo.getMethods().get(staticMethodIndex);
 
-            this.emitFunctionCall(methodInfo, A0, methodCall.args);
+            // Get the dynamic method information
+            String comment = "Load pointer to object's dispatch table.";
+            backend.emitLW(A1, A0, "@.__dispatch_table_offset__", comment);
+            backend.emitLW(A1, A1, staticMethodIndex * WORD_SIZE, "Load dynamic method to call.");
+
+            this.emitFunctionCall(staticMethodInfo, A0, A1, methodCall.args);
+
             return null;
         }
 
@@ -590,11 +603,16 @@ public class CodeGenImpl extends CodeGenBase {
         public Void analyze(ListExpr expr) {
             int listSize = expr.elements.size();
             int rewindSlots = 0;
+            boolean isObjectList =
+                this.isObjectType(expr.getInferredType().elementType());
 
             // push each list item to stack
             for (int i = 0; i < listSize; i++) {
                 // generate code for list element
                 expr.elements.get(i).dispatch(this);
+                if (isObjectList) {
+                    this.emitObjectifyType(expr.elements.get(i).getInferredType());
+                }
                 // push to stack
                 record.upSlot();
                 rewindSlots++;
@@ -658,11 +676,11 @@ public class CodeGenImpl extends CodeGenBase {
 
         /** Emit code for a new class construction: A(). */
         private void emitNewClassInstance(ClassInfo classInfo, CallExpr expr) {
-            if (classInfo.getClassName() == intClass.getClassName() ||
-                classInfo.getClassName() == boolClass.getClassName()) {
+            if (classInfo.getClassName().equals(intClass.getClassName()) ||
+                    classInfo.getClassName().equals(boolClass.getClassName())) {
                 backend.emitMV(A0, ZERO, "Special cases: int and bool unboxed");
                 return;
-            } else if (classInfo.getClassName() == strClass.getClassName()) {
+            } else if (classInfo.getClassName().equals(strClass.getClassName())) {
                 backend.emitLA(A0, constants.getStrConstant(""), "Default string is empty");
                 return;
             }
@@ -691,15 +709,29 @@ public class CodeGenImpl extends CodeGenBase {
         /** Emit code for a function call: foo(...), with function FUNCINFO
          *  and given lists of ARGS. */
         private void emitFunctionCall(FuncInfo funcInfo, List<Expr> args) {
-            this.emitFunctionCall(funcInfo, null, args);
+            this.emitFunctionCall(funcInfo, null, null, args);
+        }
+
+        /** Emit code for a function call: foo(...), with function FUNCINFO
+         *  and given lists of ARGS + an implicit SELF argument for method dispatch. */
+        private void emitFunctionCall(FuncInfo funcInfo, Register self, List<Expr> args) {
+            this.emitFunctionCall(funcInfo, self, null, args);
         }
 
         /**
          * Emit code for a function call: foo(...), with function FUNCINFO
-         * and given lists of ARGS, and an optional register SELFRS containing
-         * the pointer to the object for which the methods belong to.
+         * and given lists of ARGS, and an optional register SELF containing
+         * the pointer to the object for which the methods belong to, and
+         * an optional register METHODADDR for determining the address of the code
+         * for the function call.
+         *
+         * If METHODADDR is specified, the code jumps to function at METHODADDR.
+         * Otherwise, the code label of FUNCINFO is used.
          */
-        private void emitFunctionCall(FuncInfo funcInfo, Register selfRs, List<Expr> args) {
+        private void emitFunctionCall(FuncInfo funcInfo,
+                                      Register self,
+                                      Register methodAddr,
+                                      List<Expr> args) {
             String funcName = funcInfo.getFuncName();
 
             List<String> params = funcInfo.getParams();
@@ -707,6 +739,13 @@ public class CodeGenImpl extends CodeGenBase {
                 : "static analysis should ensure passed arguments are correct";
 
             int rewindSlots = 0;
+
+            if (methodAddr != null) {
+                record.upSlot();
+                rewindSlots++;
+                pushStackSpace("Move SP to reserve space for address of the function code");
+                record.pushToStack(methodAddr, "Push address of method's code to stack.");
+            }
 
             // push static link, if needed
             if (!this.isTopLevel(funcInfo)) {
@@ -719,11 +758,11 @@ public class CodeGenImpl extends CodeGenBase {
             }
 
             // arguments passed to method call contains implicit `self` already
-            if (selfRs != null) {
+            if (self != null) {
                 record.upSlot();
                 rewindSlots++;
                 pushStackSpace("Move SP to reserve space for `self` argument");
-                record.pushToStack(selfRs, "Push implicit `self` argument to stack.");
+                record.pushToStack(self, "Push implicit `self` argument to stack.");
                 params = params.subList(1, params.size());
             }
 
@@ -754,8 +793,14 @@ public class CodeGenImpl extends CodeGenBase {
             }
 
             // call function
-            Label calleeLabel = funcInfo.getCodeLabel();
-            backend.emitJAL(calleeLabel, String.format("Invoke function: %s", funcName));
+            if (methodAddr == null) {
+                Label calleeLabel = funcInfo.getCodeLabel();
+                backend.emitJAL(calleeLabel, String.format("Invoke function: %s", funcName));
+            } else {
+                int offset = (rewindSlots - 1) * WORD_SIZE;
+                backend.emitLW(methodAddr, SP, offset, "Restore address to method's code");
+                backend.emitJALR(methodAddr, String.format("Invoke function: %s", funcName));
+            }
 
             // pop arguments and static link
             if (rewindSlots != 0) {
@@ -2015,7 +2060,8 @@ public class CodeGenImpl extends CodeGenBase {
             backend.emitLI(rd, boolValue ? 1 : 0, comment);
         } else if (literal instanceof StringLiteral) {
             String strValue = ((StringLiteral) literal).value;
-            String comment = String.format("Load string literal: %s", strValue);
+            // we don't print string, in case it's too long, or have line-breaks
+            String comment = "Load string literal";
             backend.emitLA(rd, this.constants.getStrConstant(strValue), comment);
         } else {
             assert literal instanceof NoneLiteral;
