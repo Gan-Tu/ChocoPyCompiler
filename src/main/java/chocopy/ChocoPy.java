@@ -260,6 +260,10 @@ public class ChocoPy {
               .help("Passes to run: `.` = skip pass, `s` = run pass");
         parser.addArgument("--run").action(storeTrue())
               .help("Execute generated assembly (requires code generation)");
+        parser.addArgument("--execute").action(storeTrue())
+              .help("Execute a ChocoPy program.\n" +
+                    "This command ignores --action and --run flag and " +
+                    "use all three passes (program -> lexical -> static analysis -> codegen -> run)");
         parser.addArgument("--debug").action(storeTrue())
               .help("Print debugging information.");
         parser.addArgument("--out").type(String.class)
@@ -277,6 +281,14 @@ public class ChocoPy {
             }
             // run flag
             this.runFlag = (boolean) res.get("run");
+            // execute flag
+            boolean executeFlag = (boolean) res.get("execute");
+            if (executeFlag) {
+                this.passes[0] = 's';
+                this.passes[1] = 's';
+                this.passes[2] = 's';
+                this.runFlag = true;
+            }
             // debug flag
             this.debug = (boolean) res.get("debug");
             // initialize output file
