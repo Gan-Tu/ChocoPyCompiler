@@ -14,11 +14,10 @@ import chocopy.common.analysis.SymbolTable;
  */
 public class VariableAddressAccessor extends VariableAccessor {
 
-    public VariableAddressAccessor(StackRecord record,
-                                   FuncInfo funcInfo,
+    public VariableAddressAccessor(FuncInfo funcInfo,
                                    SymbolTable<SymbolInfo> globalSymbols,
                                    RiscVBackend backend) {
-        super(record, funcInfo, globalSymbols, backend);
+        super(funcInfo, globalSymbols, backend);
     }
 
     protected void emitFromOffset(Register rd,

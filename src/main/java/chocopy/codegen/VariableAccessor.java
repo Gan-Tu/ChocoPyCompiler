@@ -25,39 +25,49 @@ import static chocopy.common.codegen.RiscVBackend.Register.T0;
  */
 public abstract class VariableAccessor {
 
-    /** An activation record for reading from and writing to stack. */
-    protected StackRecord record;
-    /** The current function for which the accessor tries to read variables from. */
+    /**
+     * The current function for which the accessor tries to read variables from.
+     */
     protected FuncInfo funcInfo;
-    /** The global symbol table. */
+    /**
+     * The global symbol table.
+     */
     protected final SymbolTable<SymbolInfo> globalSymbols;
-    /** The backend that emits assembly. */
+    /**
+     * The backend that emits assembly.
+     */
     protected final RiscVBackend backend;
-    /** Given offset for the header of a class. */
+    /**
+     * Given offset for the header of a class.
+     */
     protected final int HEADER_OFFSET = 12;
 
-    public VariableAccessor(StackRecord record,
-                            FuncInfo funcInfo,
+    public VariableAccessor(FuncInfo funcInfo,
                             SymbolTable<SymbolInfo> globalSymbols,
                             RiscVBackend backend) {
-        this.record = record;
         this.funcInfo = funcInfo;
         this.globalSymbols = globalSymbols;
         this.backend = backend;
     }
 
-    /** Set current function. */
+    /**
+     * Set current function.
+     */
     public void setFunctionInfo(FuncInfo funcInfo) {
         this.funcInfo = funcInfo;
     }
 
-    /** Get current function. */
+    /**
+     * Get current function.
+     */
     public FuncInfo getFunctionInfo(FuncInfo funcInfo) {
         return this.funcInfo;
     }
 
-    /** Read value of a variable NAME from current function into register RD.
-     *  The value can be a parameter, local, inherited, or global variable. */
+    /**
+     * Read value of a variable NAME from current function into register RD.
+     * The value can be a parameter, local, inherited, or global variable.
+     */
     public void readVariable(Register rd, String name) {
         // get symbol table
         SymbolTable<SymbolInfo> sym = globalSymbols;
@@ -69,7 +79,7 @@ public abstract class VariableAccessor {
         SymbolInfo symInfo = sym.get(name);
         if (symInfo == null) {
             throw new IllegalArgumentException(
-                "static analysis should ensure variable exists."
+                    "static analysis should ensure variable exists."
             );
         }
 
@@ -85,7 +95,7 @@ public abstract class VariableAccessor {
         } else {
             assert symInfo instanceof AttrInfo;
             throw new IllegalArgumentException(
-                "Do not support accessing attributes using only a name."
+                    "Do not support accessing attributes using only a name."
             );
         }
     }
@@ -93,14 +103,15 @@ public abstract class VariableAccessor {
     /**
      * Load value, or address, of an attribute from an object instance pointer
      * located in register RS and stores it in register RD.
-     * @param rd Destination for the attribute.
-     * @param rs Register in which the address for the object instance is located.
+     *
+     * @param rd   Destination for the attribute.
+     * @param rs   Register in which the address for the object instance is located.
      * @param expr The member expression.
      */
     public void readAttribute(Register rd, Register rs, MemberExpr expr) {
         SymbolType objectType = expr.object.getInferredType();
         assert objectType instanceof ClassValueType
-            : "static analysis should ensure member expressions can access class types.";
+                : "static analysis should ensure member expressions can access class types.";
 
         String className = objectType.className();
         ClassInfo classInfo = (ClassInfo) globalSymbols.get(className);
@@ -120,17 +131,22 @@ public abstract class VariableAccessor {
     /*--------------------------------------------------------------*/
 
     protected abstract void emitFromOffset(Register rd, Register rs, int offset, String comment);
+
     protected abstract void emitFromLabel(Register rd, Label label, String comment);
 
 
-    /** Read value of local variable NAME of current funcInfo into register RD. */
+    /**
+     * Read value of local variable NAME of current funcInfo into register RD.
+     */
     protected void readLocalVariable(Register rd, String name) {
         String comment = this.makeLocalVariableComment(name);
         int offset = this.getVarOffset(this.funcInfo, name);
         this.emitFromOffset(rd, FP, offset, comment);
     }
 
-    /** Read value of a global variable NAME into register RD. */
+    /**
+     * Read value of a global variable NAME into register RD.
+     */
     protected void readGlobalVariable(Register rd, String name) {
         assert globalSymbols.declares(name)
                 : "static analysis should ensure global variable exists";
@@ -154,15 +170,16 @@ public abstract class VariableAccessor {
         FuncInfo curFuncInfo = this.funcInfo;
         backend.emitMV(T0, FP, "Copy FP value to T0");
 
-
         // follow static links to the function scope in which the variable is defined
-        while (!curFuncInfo.getFuncName().equals(varFuncName)) {
+        int distance = curFuncInfo.getDepth() - varInfo.getFuncInfo().getDepth();
+        while (distance > 0) {
             String curFuncName = curFuncInfo.getFuncName();
             String parentFuncName = curFuncInfo.getParentFuncInfo().getFuncName();
             String comment = String.format("Load static link from %s to %s",
                     curFuncName, parentFuncName);
             backend.emitLW(T0, T0, this.getStaticLinkOffset(curFuncInfo), comment);
             curFuncInfo = curFuncInfo.getParentFuncInfo();
+            distance--;
         }
 
         assert curFuncInfo.getSymbolTable().declares(varBaseName)
@@ -180,7 +197,9 @@ public abstract class VariableAccessor {
     /*                                                              */
     /*--------------------------------------------------------------*/
 
-    /** Return a comment printed in assembly code for accessing variable NAME. */
+    /**
+     * Return a comment printed in assembly code for accessing variable NAME.
+     */
     protected String makeLocalVariableComment(String name) {
         String varFullname =
                 String.format("%s.%s", funcInfo.getFuncName(), name);
@@ -201,9 +220,11 @@ public abstract class VariableAccessor {
         return funcInfo.getParams().size() * backend.getWordSize();
     }
 
-    /** Return true if a function FUNCINFO is a top level function. */
+    /**
+     * Return true if a function FUNCINFO is a top level function.
+     */
     protected boolean isTopLevel(FuncInfo funcInfo) {
-        return  funcInfo == null ||
+        return funcInfo == null ||
                 funcInfo.getParentFuncInfo() == null;
     }
 
@@ -220,7 +241,9 @@ public abstract class VariableAccessor {
         return -(varIndex - (paramSize - 1)) * this.backend.getWordSize();
     }
 
-    /** Return the offset for a given attribute NAME of CLASSINFO. */
+    /**
+     * Return the offset for a given attribute NAME of CLASSINFO.
+     */
     private int getAttrOffset(ClassInfo classInfo, String name) {
         int attributeIndex = classInfo.getAttributeIndex(name);
         return HEADER_OFFSET + attributeIndex * this.backend.getWordSize();

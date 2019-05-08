@@ -14,24 +14,23 @@ import chocopy.common.analysis.SymbolTable;
  */
 public class VariableValueAccessor extends VariableAccessor {
 
-    public VariableValueAccessor(StackRecord record,
-                                 FuncInfo funcInfo,
+    public VariableValueAccessor(FuncInfo funcInfo,
                                  SymbolTable<SymbolInfo> globalSymbols,
                                  RiscVBackend backend) {
-        super(record, funcInfo, globalSymbols, backend);
+        super(funcInfo, globalSymbols, backend);
     }
 
     protected void emitFromOffset(Register rd,
                                   Register rs,
                                   int offset,
                                   String comment) {
-        this.record.readFromOffset(rd, rs, offset, comment);
+        this.backend.emitLW(rd, rs, offset, comment);
     }
 
     protected void emitFromLabel(Register rd,
                                  Label label,
                                  String comment) {
-        this.record.readFromLabel(rd, label, comment);
+        this.backend.emitLW(rd, label, comment);
     }
 
 }

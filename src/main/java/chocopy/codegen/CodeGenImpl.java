@@ -39,7 +39,6 @@ import java.util.List;
 import java.util.ArrayList;
 
 import static chocopy.common.analysis.types.SymbolType.BOOL_TYPE;
-import static chocopy.common.analysis.types.SymbolType.EMPTY_TYPE;
 import static chocopy.common.analysis.types.SymbolType.INT_TYPE;
 import static chocopy.common.analysis.types.SymbolType.NONE_TYPE;
 import static chocopy.common.analysis.types.SymbolType.OBJECT_TYPE;
@@ -75,40 +74,86 @@ public class CodeGenImpl extends CodeGenBase {
     public final int MAX_CHAR_DECIMAL = 256;
     public final int ONE_CHAR_STR_OBJECT_SIZE = 20;
 
-    /** An activation record for reading from and writing to stack. */
+    /**
+     * The location of the text resources containing custom library code.
+     */
+    protected static final String CUSTOM_LIBRARY_CODE_DIR = "chocopy/codegen/asm/";
+
+    /**
+     * An activation record for reading from and writing to stack.
+     */
     protected final StackRecord record;
 
-    /** A code generator emitting instructions to BACKEND. */
+    /**
+     * A code generator emitting instructions to BACKEND.
+     */
     public CodeGenImpl(RiscVBackend backend) {
         super(backend);
         record = new StackRecord(backend, globalSymbols);
     }
 
-    /** Bad argument. */
+    /**
+     * Bad argument.
+     */
     private final Label errorArg = new Label("error.ARG");
-    /** Operation on None. */
+    /**
+     * Operation on None.
+     */
     private final Label errorNone = new Label("error.None");
-    /** Division by zero. */
+    /**
+     * Division by zero.
+     */
     private final Label errorDiv = new Label("error.Div");
-    /** Index out of bounds. */
+    /**
+     * Index out of bounds.
+     */
     private final Label errorOob = new Label("error.OOB");
-    /** Out of memory. */
+    /**
+     * Out of memory.
+     */
     private final Label errorOom = new Label("error.OOM");
-    /** Unimplemented operation. */
+    /**
+     * Unimplemented operation.
+     */
     private final Label errorNyi = new Label("error.NYI");
 
-    /** List construction. */
+    /**
+     * List construction.
+     */
     private final Label constlistLabel = new Label("conslist");
-    /** List concatenation. */
-    private final Label listconcatLabel = new Label("listcat");
-    /** String comparison. */
+    /**
+     * List concatenation.
+     */
+    private final Label listconcatLabel = new Label("concat");
+    /**
+     * String comparison.
+     */
     private final Label streqLabel = new Label("streql");
-    /** String concatenation. */
+    /**
+     * String concatenation.
+     */
     private final Label strcatLabel = new Label("strcat");
-    /** Character Initialization. */
+    /**
+     * Character Initialization.
+     */
     private final Label charInitLabel = new Label("initchars");
-    /** All one-character singles. */
+    /**
+     * All one-character singles.
+     */
     private final Label allChars = new Label("allChars");
+
+    /**
+     * Box integer as objects.
+     */
+    private final Label boxInt = new Label("boxInt");
+    /**
+     * Box boolean as objects.
+     */
+    private final Label boxBool = new Label("boxBool");
+    /**
+     * Box nothing.
+     */
+    private final Label nobox = new Label("nobox");
 
     @Override
     protected void initAsmConstants() {
@@ -134,13 +179,10 @@ public class CodeGenImpl extends CodeGenBase {
         StmtAnalyzer stmtAnalyzer = new StmtAnalyzer(null);
 
         backend.emitADDI(SP, SP, -2 * WORD_SIZE,
-                         "Saved FP and saved RA (unused at top level).");
-
+                "Saved FP and saved RA (unused at top level).");
         backend.emitSW(ZERO, SP, 0, "Top saved FP is 0.");
-        record.upSlot(); // slot 0 is saved RA
-
         backend.emitSW(ZERO, SP, 4, "Top saved RA is 0.");
-        record.upSlot(); // slot 1 is saved dynamic lin
+        record.upSlot(2);
 
         backend.emitADDI(FP, SP, 2 * WORD_SIZE, "Set FP to previous SP.");
 
@@ -173,28 +215,36 @@ public class CodeGenImpl extends CodeGenBase {
 
         // function prologue
         this.emitFunctionPrologue();
-        record.upSlot(); // slot 0 is saved RA
-        record.upSlot(); // slot 1 is saved dynamic link
 
         // reserve space on stack for locals
-        int localsSize = funcInfo.getLocals().size()  * WORD_SIZE;
+        int localsSize = funcInfo.getLocals().size() * WORD_SIZE;
         if (localsSize != 0) {
             this.allocateStackSpace(localsSize, "Reserve space for locals");
         }
 
-         // emit code to save local variables' literal values on stack
+        // emit code to save local variables' literal values on stack
         for (StackVarInfo var : funcInfo.getLocals()) {
             String varName = var.getVarName();
             String pushComment = String.format("assign to local variable: %s", varName);
 
             // load variable value
-            this.emitLoadLiteral(A0, var.getInitialValue());
+            Literal value = var.getInitialValue();
+            this.emitLoadLiteral(A0, value);
+
+            // box local variable
+            if (OBJECT_TYPE.equals(var.getVarType())) {
+                if (INT_TYPE.equals(value.getInferredType())) {
+                    backend.emitJAL(boxInt, "Jump to integer boxing routine");
+                } else if (BOOL_TYPE.equals(value.getInferredType())) {
+                    backend.emitJAL(boxBool, "Jump to boolean boxing routine");
+                }
+            }
 
             // save value on stack
-            record.upSlot();
             int offset = this.getVarOffset(funcInfo, varName);
             backend.emitSW(A0, FP, offset, pushComment);
         }
+        record.upSlot(funcInfo.getLocals().size());
 
         // generate code for function statements
         for (Stmt stmt : funcInfo.getStatements()) {
@@ -209,7 +259,9 @@ public class CodeGenImpl extends CodeGenBase {
         backend.emitJR(RA, "Return to caller");
     }
 
-    /** An analyzer that encapsulates code generation for statments. */
+    /**
+     * An analyzer that encapsulates code generation for statments.
+     */
     private class StmtAnalyzer extends AbstractNodeAnalyzer<Void> {
         /*
          * The symbol table has all the info you need to determine
@@ -242,17 +294,25 @@ public class CodeGenImpl extends CodeGenBase {
          * appropriate info for the var that is currently in scope.
          */
 
-        /** Symbol table for my statements. */
+        /**
+         * Symbol table for my statements.
+         */
         private SymbolTable<SymbolInfo> sym;
 
-        /** Label of code that exits from procedure. */
+        /**
+         * Label of code that exits from procedure.
+         */
         protected Label epilogue;
 
-        /** The descriptor for the current function, or null at the top level. */
+        /**
+         * The descriptor for the current function, or null at the top level.
+         */
         private FuncInfo funcInfo;
 
-        /** An analyzer for the function described by FUNCINFO0, which is null
-         *  for the top level. */
+        /**
+         * An analyzer for the function described by FUNCINFO0, which is null
+         * for the top level.
+         */
         StmtAnalyzer(FuncInfo funcInfo0) {
             this.funcInfo = funcInfo0;
             if (funcInfo == null) {
@@ -268,9 +328,12 @@ public class CodeGenImpl extends CodeGenBase {
         @Override
         public Void analyze(ReturnStmt stmt) {
             if (stmt.value == null) {
-                backend.emitLI(A0, 0, "No return value specified. Return NONE implicitly");
+                backend.emitMV(A0, ZERO, "No return value specified. Return NONE implicitly");
             } else {
                 stmt.value.dispatch(this);
+                if (this.isObjectType(this.funcInfo.getReturnType())) {
+                    this.emitObjectifyType(stmt.value.getInferredType());
+                }
             }
 
             backend.emitJ(this.epilogue, "Encounter RETURN! Jump to function epilogue.");
@@ -441,7 +504,7 @@ public class CodeGenImpl extends CodeGenBase {
                 this.emitForStr(forStmt);
             } else {
                 throw new IllegalArgumentException(
-                    "static analysis should ensure for loop iterable is list or string"
+                        "static analysis should ensure for loop iterable is list or string"
                 );
             }
 
@@ -455,7 +518,6 @@ public class CodeGenImpl extends CodeGenBase {
             // evaluate RHS expression and store in A0
             stmt.value.dispatch(this);
             // save evaluated RHS value on stack
-            record.upSlot();
             record.pushToStack(A0, "Push result of assignment RHS value to stack.");
             pushStackSpace("Reserve space for saved RHS value");
 
@@ -473,7 +535,7 @@ public class CodeGenImpl extends CodeGenBase {
                 } else if (target instanceof IndexExpr) {
                     IndexExpr indexExpr = (IndexExpr) target;
                     assert indexExpr.getInferredType().isListType()
-                        : "static analysis must ensure only assignment to list index is allowed";
+                            : "static analysis must ensure only assignment to list index is allowed";
                     comment = "Set list element";
                     // get address of the list element in A0
                     this.emitGetListElement(indexExpr);
@@ -484,38 +546,40 @@ public class CodeGenImpl extends CodeGenBase {
 
                     // evaluate object expressions, and save result in A0
                     member.object.dispatch(this);
+
+                    // box bool/int values if necessary
+                    this.emitObjectifyType(member.object.getInferredType());
+
                     // advance to the address of the specific attribute, save in T0
                     record.readAttributeAddress(T0, A0, member);
 
                     // sanity check
                     if (member.object == null ||
-                        member.object.getInferredType() == null ||
-                        member.object.getInferredType().className() == null) {
+                            member.object.getInferredType() == null ||
+                            member.object.getInferredType().className() == null) {
                         throw new IllegalArgumentException(
-                            "static analysis should ensure member expr works on object type"
+                                "static analysis should ensure member expr works on object type"
                         );
                     }
 
                     String className = member.object.getInferredType().className();
                     comment = String.format("Set attribute: %s.$s",
-                                             className, member.member.name);
+                            className, member.member.name);
                 } else {
                     throw new IllegalArgumentException("invalid assignment target");
                 }
 
                 // retrieve RHS value
-                record.readFromStack(A0, "Retrieve result of assignment RHS value.");
+                record.peekFromStack(A0, "Retrieve result of assignment RHS value.");
                 // box the value in A0, if needed
                 if (this.isObjectType(target.getInferredType())) {
                     // save T0
-                    record.upSlot();
                     pushStackSpace("Reserve space for address pointer");
                     record.pushToStack(T0, "Push address of target to stack");
                     // objectify
                     this.emitObjectifyType(rhsValueType);
                     // restore T0
-                    record.readFromStack(T0, "Read address of target from stack");
-                    record.downSlot();
+                    record.popFromStack(T0, "Read address of target from stack");
                     popStackSpace("Pop stack space for address pointer");
                 }
                 // assign value
@@ -532,7 +596,7 @@ public class CodeGenImpl extends CodeGenBase {
         @Override
         public Void analyze(Identifier id) {
             assert this.sym.get(id.name) != null
-                : "semantic analysis should ensure identifier exists";
+                    : "semantic analysis should ensure identifier exists";
             record.readVariable(A0, id.name);
             return null;
         }
@@ -543,6 +607,9 @@ public class CodeGenImpl extends CodeGenBase {
 
             // emit code to save address of the object in A0
             memberExpr.object.dispatch(this);
+
+            // box bool/int values if necessary
+            this.emitObjectifyType(memberExpr.object.getInferredType());
 
             // check against None
             backend.emitBNEZ(A0, nonNoneClassLabel, "Ensure class reference is not None");
@@ -562,7 +629,7 @@ public class CodeGenImpl extends CodeGenBase {
                 return null;
             } else if (!(method.object.getInferredType() instanceof ClassValueType)) {
                 throw new IllegalArgumentException(
-                    "static analysis should check that MethodCallExpr acts on object type"
+                        "static analysis should check that MethodCallExpr acts on object type"
                 );
             }
 
@@ -572,12 +639,15 @@ public class CodeGenImpl extends CodeGenBase {
 
             if (staticClassInfo == null) {
                 throw new IllegalArgumentException(
-                    "static analysis should ensure MethodCallExpr acts on existing objects"
+                        "static analysis should ensure MethodCallExpr acts on existing objects"
                 );
             }
 
             // load address to object into A0
             methodCall.method.object.dispatch(this);
+
+            // box bool/int values if necessary
+            this.emitObjectifyType(methodCall.method.object.getInferredType());
 
             // check against None
             backend.emitBNEZ(A0, nonNoneClassLabel, "Ensure object reference is not None");
@@ -604,7 +674,7 @@ public class CodeGenImpl extends CodeGenBase {
             int listSize = expr.elements.size();
             int rewindSlots = 0;
             boolean isObjectList =
-                this.isObjectType(expr.getInferredType().elementType());
+                    this.isObjectType(expr.getInferredType().elementType());
 
             // push each list item to stack
             for (int i = 0; i < listSize; i++) {
@@ -614,16 +684,14 @@ public class CodeGenImpl extends CodeGenBase {
                     this.emitObjectifyType(expr.elements.get(i).getInferredType());
                 }
                 // push to stack
-                record.upSlot();
                 rewindSlots++;
                 pushStackSpace(
-                    String.format("Reserve stack space for list element %d", i)
+                        String.format("Reserve stack space for list element %d", i)
                 );
                 record.pushToStack(A0, String.format("Push list element %d to stack", i));
             }
 
             // push list length
-            record.upSlot();
             rewindSlots++;
             pushStackSpace("Reserve stack space for argument: list length");
             backend.emitLI(A0, listSize, "Load list length");
@@ -649,9 +717,9 @@ public class CodeGenImpl extends CodeGenBase {
 
             SymbolType exprListType = expr.list.getInferredType();
             assert exprListType.isListType() || this.isStringType(exprListType)
-                : "static analysis should ensure index expression acts on lists or strings";
+                    : "static analysis should ensure index expression acts on lists or strings";
             assert this.isIntegerType(expr.index.getInferredType())
-                : "static analysis should ensure index is integer";
+                    : "static analysis should ensure index is integer";
 
             if (exprListType.isListType()) {
                 // get address of the list element
@@ -674,7 +742,9 @@ public class CodeGenImpl extends CodeGenBase {
 
         /*---------------- FUNCTION & METHOD CALLS  ------------------*/
 
-        /** Emit code for a new class construction: A(). */
+        /**
+         * Emit code for a new class construction: A().
+         */
         private void emitNewClassInstance(ClassInfo classInfo, CallExpr expr) {
             if (classInfo.getClassName().equals(intClass.getClassName()) ||
                     classInfo.getClassName().equals(boolClass.getClassName())) {
@@ -692,30 +762,29 @@ public class CodeGenImpl extends CodeGenBase {
             int initMethodIndex = classInfo.getMethodIndex("__init__");
             FuncInfo initMethod = classInfo.getMethods().get(initMethodIndex);
 
+            // Get the dynamic method information
+            String comment = "Load pointer to object's dispatch table.";
+            backend.emitLW(A1, A0, "@.__dispatch_table_offset__", comment);
+            backend.emitLW(A1, A1, initMethodIndex * WORD_SIZE, "Load dynamic __init__ to call.");
+
             // save address to the allocated object instance on stack
-            record.upSlot();
             record.pushToStack(A0, "Push pointer to object instance on stack.");
             pushStackSpace("Reserve space for the object pointer");
 
             // call __init__ method
-            this.emitFunctionCall(initMethod, A0, new ArrayList<>());
+            this.emitFunctionCall(initMethod, A0, A1, new ArrayList<>());
 
             // restore pointer to the object instance
-            record.readFromStack(A0, "Restore pointer to newly created object instance.");
-            record.downSlot();
+            record.popFromStack(A0, "Restore pointer to newly created object instance.");
             popStackSpace("Pop the object pointer of the stack");
         }
 
-        /** Emit code for a function call: foo(...), with function FUNCINFO
-         *  and given lists of ARGS. */
+        /**
+         * Emit code for a function call: foo(...), with function FUNCINFO
+         * and given lists of ARGS.
+         */
         private void emitFunctionCall(FuncInfo funcInfo, List<Expr> args) {
             this.emitFunctionCall(funcInfo, null, null, args);
-        }
-
-        /** Emit code for a function call: foo(...), with function FUNCINFO
-         *  and given lists of ARGS + an implicit SELF argument for method dispatch. */
-        private void emitFunctionCall(FuncInfo funcInfo, Register self, List<Expr> args) {
-            this.emitFunctionCall(funcInfo, self, null, args);
         }
 
         /**
@@ -736,12 +805,11 @@ public class CodeGenImpl extends CodeGenBase {
 
             List<String> params = funcInfo.getParams();
             assert params.size() == args.size()
-                : "static analysis should ensure passed arguments are correct";
+                    : "static analysis should ensure passed arguments are correct";
 
             int rewindSlots = 0;
 
             if (methodAddr != null) {
-                record.upSlot();
                 rewindSlots++;
                 pushStackSpace("Move SP to reserve space for address of the function code");
                 record.pushToStack(methodAddr, "Push address of method's code to stack.");
@@ -749,9 +817,7 @@ public class CodeGenImpl extends CodeGenBase {
 
             // push static link, if needed
             if (!this.isTopLevel(funcInfo)) {
-                record.upSlot();
                 rewindSlots++;
-
                 this.emitStaticLink(T0, funcInfo);
                 pushStackSpace("Move SP to reserve space for static link");
                 record.pushToStack(T0, "Push static link on stack");
@@ -759,7 +825,6 @@ public class CodeGenImpl extends CodeGenBase {
 
             // arguments passed to method call contains implicit `self` already
             if (self != null) {
-                record.upSlot();
                 rewindSlots++;
                 pushStackSpace("Move SP to reserve space for `self` argument");
                 record.pushToStack(self, "Push implicit `self` argument to stack.");
@@ -786,7 +851,6 @@ public class CodeGenImpl extends CodeGenBase {
                     this.emitObjectifyType(args.get(i).getInferredType());
                 }
 
-                record.upSlot();
                 rewindSlots++;
                 pushStackSpace(String.format("Reserve space for argument %d on stack", i));
                 record.pushToStack(A0, String.format("Push argument %d to stack", i));
@@ -805,7 +869,7 @@ public class CodeGenImpl extends CodeGenBase {
             // pop arguments and static link
             if (rewindSlots != 0) {
                 deallocateStackSpace(rewindSlots * WORD_SIZE,
-                                "Pop arguments and static link off the stack");
+                        "Pop arguments and static link off the stack");
                 record.downSlot(rewindSlots);
             }
 
@@ -817,20 +881,20 @@ public class CodeGenImpl extends CodeGenBase {
 
         /*---------------- BINARY EXPRESSIONS  ------------------*/
 
-        /** Emit code for arithmetic expression. */
+        /**
+         * Emit code for arithmetic expression.
+         */
         private void emitIntegerBinaryExpr(BinaryExpr expr) {
             /* There is no short-circuiting for integers. */
 
             // evaluate left expression, and save it on stack
             expr.left.dispatch(this);
-            record.upSlot();
             record.pushToStack(A0, "Save result of left operand to stack.");
             pushStackSpace("Reserve space for saved left operand result");
 
             // evaluate right expression, and save result in A0
             expr.right.dispatch(this);
-            record.readFromStack(T0, "Retrieve result of left operand.");
-            record.downSlot();
+            record.popFromStack(T0, "Retrieve result of left operand.");
             popStackSpace("Pop off saved left operand result");
 
             Label nonzeroDivisorLabel = generateLocalLabel();
@@ -899,10 +963,12 @@ public class CodeGenImpl extends CodeGenBase {
             }
         }
 
-        /** Emit code for binary expression of boolean type. */
+        /**
+         * Emit code for binary expression of boolean type.
+         */
         private void emitBooleanBinaryExpr(BinaryExpr expr) {
             assert this.isBooleanType(expr.getInferredType())
-                : "can only call boolean comparison routine for boolean expressions";
+                    : "can only call boolean comparison routine for boolean expressions";
 
             // Always evaluate the left operand in booleans
             Label shortCircuitLabel = generateLocalLabel();
@@ -934,14 +1000,12 @@ public class CodeGenImpl extends CodeGenBase {
             /* There is no short-circuiting for other boolean comparisons. */
 
             // save left expression result on stack
-            record.upSlot();
             record.pushToStack(A0, "Save result of left operand to stack.");
             pushStackSpace("Reserve space for saved left operand result");
 
             // evaluate right expression, and save result in A0
             expr.right.dispatch(this);
-            record.readFromStack(T0, "Retrieve result of left operand.");
-            record.downSlot();
+            record.popFromStack(T0, "Retrieve result of left operand.");
             popStackSpace("Pop off saved left operand result");
 
             // comparisons
@@ -979,14 +1043,12 @@ public class CodeGenImpl extends CodeGenBase {
                         backend.emitSEQZ(A0, A0, "Operator: ==");
                     } else if (this.isStringType(expr.left.getInferredType())) {
                         assert this.isStringType(expr.left.getInferredType()) &&
-                               this.isStringType(expr.right.getInferredType())
-                            : "static analysis should ensure string concatenation acts on strings";
+                                this.isStringType(expr.right.getInferredType())
+                                : "static analysis should ensure string concatenation acts on strings";
 
                         // pass strings as arguments
                         allocateStackSpace(2 * WORD_SIZE, "Reserve space for two string pointers");
-                        record.upSlot();
                         record.pushToStack(T0, "Save pointer to first string on stack.");
-                        record.upSlot();
                         record.pushToStack(A0, "Save pointer to second string on stack.");
 
                         // call string comparison routine
@@ -1016,15 +1078,13 @@ public class CodeGenImpl extends CodeGenBase {
                         backend.emitXOR(A0, T0, A0, "Compare references");
                         backend.emitSNEZ(A0, A0, "Operator: !=");
                     } else if (this.isStringType(expr.left.getInferredType())) {
-                       assert this.isStringType(expr.left.getInferredType()) &&
-                               this.isStringType(expr.right.getInferredType())
-                            : "static analysis should ensure string concatenation acts on strings";
+                        assert this.isStringType(expr.left.getInferredType()) &&
+                                this.isStringType(expr.right.getInferredType())
+                                : "static analysis should ensure string concatenation acts on strings";
 
                         // pass strings as arguments
                         allocateStackSpace(2 * WORD_SIZE, "Reserve space for two string pointers");
-                        record.upSlot();
                         record.pushToStack(T0, "Save pointer to first string on stack.");
-                        record.upSlot();
                         record.pushToStack(A0, "Save pointer to second string on stack.");
 
                         // call string comparison routine
@@ -1056,7 +1116,9 @@ public class CodeGenImpl extends CodeGenBase {
             }
         }
 
-        /** Emit code for binary expression of string type. */
+        /**
+         * Emit code for binary expression of string type.
+         */
         private void emitStringBinaryExpr(BinaryExpr expr) {
             /* There is no short-circuiting for strings. */
 
@@ -1065,18 +1127,16 @@ public class CodeGenImpl extends CodeGenBase {
             }
 
             assert this.isStringType(expr.left.getInferredType()) &&
-                   this.isStringType(expr.right.getInferredType())
-                : "static analysis should ensure string concatenation acts on strings";
+                    this.isStringType(expr.right.getInferredType())
+                    : "static analysis should ensure string concatenation acts on strings";
 
             // evaluate left expression, and save it on stack
             expr.left.dispatch(this);
-            record.upSlot();
             pushStackSpace("Reserve space for saved left operand result");
             record.pushToStack(A0, "Save result of left operand to stack.");
 
             // evaluate right expression, and save result in A0
             expr.right.dispatch(this);
-            record.upSlot();
             pushStackSpace("Reserve space for saved right operand result");
             record.pushToStack(A0, "Save result of right operand to stack.");
 
@@ -1085,11 +1145,13 @@ public class CodeGenImpl extends CodeGenBase {
 
             // deallocate stack space
             deallocateStackSpace(2 * WORD_SIZE,
-                                 "Pop left and right operand results from stack");
+                    "Pop left and right operand results from stack");
             record.downSlot(2);
         }
 
-        /** Emit code for binary expression of list type. */
+        /**
+         * Emit code for binary expression of list type.
+         */
         private void emitListBinaryExpr(BinaryExpr expr) {
             /* There is no short-circuiting for lists. */
 
@@ -1098,18 +1160,51 @@ public class CodeGenImpl extends CodeGenBase {
             }
 
             assert expr.left.getInferredType().isListType() &&
-                   expr.right.getInferredType().isListType()
-                : "static analysis should ensure list concatenation acts on lists";
+                    expr.right.getInferredType().isListType()
+                    : "static analysis should ensure list concatenation acts on lists";
+
+            // select list element boxing routine for concatenation
+            allocateStackSpace(2 * WORD_SIZE, "Reserve space for address of boxing routines");
+            if (this.isObjectType(expr.getInferredType().elementType())) {
+                backend.emitLA(T0, nobox, "Load address to boxing routine: no boxing");
+                backend.emitLA(T1, boxInt, "Load address to boxing routine: boxing integer");
+                backend.emitLA(T2, boxBool, "Load address to boxing routine: boxing booleans");
+
+                // boxing routine for first list
+                boolean firstIntList = this.isIntegerType(expr.left.getInferredType().elementType());
+                boolean firstBoolList = this.isBooleanType(expr.left.getInferredType().elementType());
+
+                if (firstIntList) {
+                    record.pushToStack(T1, "Integer boxing for first list");
+                } else if (firstBoolList) {
+                    record.pushToStack(T2, "Boolean boxing for first list");
+                } else {
+                    record.pushToStack(T0, "No boxing for first list");
+                }
+
+                // boxing routine for second list
+                boolean secondIntList = this.isIntegerType(expr.right.getInferredType().elementType());
+                boolean secondBoolList = this.isBooleanType(expr.right.getInferredType().elementType());
+                if (secondIntList) {
+                    record.pushToStack(T1, "Integer boxing for second list");
+                } else if (secondBoolList) {
+                    record.pushToStack(T2, "Boolean boxing for second list");
+                } else {
+                    record.pushToStack(T0, "No boxing for second list");
+                }
+            } else {
+                backend.emitLA(T0, nobox, "Load address to boxing routine: no boxing");
+                record.pushToStack(T0, "No boxing for first list");
+                record.pushToStack(T0, "No boxing for second list");
+            }
 
             // evaluate left expression, and save it on stack
             expr.left.dispatch(this);
-            record.upSlot();
             pushStackSpace("Reserve space for saved left operand result");
             record.pushToStack(A0, "Save result of left operand to stack.");
 
             // evaluate right expression, and save result in A0
             expr.right.dispatch(this);
-            record.upSlot();
             pushStackSpace("Reserve space for saved right operand result");
             record.pushToStack(A0, "Save result of right operand to stack.");
 
@@ -1117,21 +1212,22 @@ public class CodeGenImpl extends CodeGenBase {
             backend.emitJAL(listconcatLabel, "Concatenate the lists");
 
             // deallocate stack space
-            deallocateStackSpace(2 * WORD_SIZE,
-                                 "Pop left and right operand results from stack");
-            record.downSlot(2);
+            deallocateStackSpace(4 * WORD_SIZE,
+                    "Pop list concatenation arguments from stack");
+            record.downSlot(4);
         }
 
         /*----------------------- INDEXING  -----------------------*/
 
-        /** Emit code to fetch ADDRESS of the list element in an IndexExpr. */
+        /**
+         * Emit code to fetch ADDRESS of the list element in an IndexExpr.
+         */
         private void emitGetListElement(IndexExpr expr) {
             Label checkOOBLabel = generateLocalLabel();
             Label noErrorLabel = generateLocalLabel();
 
             // evaluate list expression, and save it on stack
             expr.list.dispatch(this);
-            record.upSlot();
             record.pushToStack(A0, "Save list pointer on stack.");
             pushStackSpace("Reserve space for saved list pointer");
 
@@ -1139,8 +1235,7 @@ public class CodeGenImpl extends CodeGenBase {
             expr.index.dispatch(this);
 
             // restore list pointer
-            record.readFromStack(A1, "Retrieve list pointer in A1.");
-            record.downSlot();
+            record.popFromStack(A1, "Retrieve list pointer in A1.");
             popStackSpace("Pop off saved list pointer from stack");
 
             // ensure list pointer is not None
@@ -1160,14 +1255,15 @@ public class CodeGenImpl extends CodeGenBase {
             backend.emitADD(A0, A0, T0, "Point A0 to the list element at given index");
         }
 
-        /** Emit code to fetch ADDRESS of the string character in an IndexExpr. */
+        /**
+         * Emit code to fetch ADDRESS of the string character in an IndexExpr.
+         */
         private void emitGetStringElement(IndexExpr expr) {
             Label checkOOBLabel = generateLocalLabel();
             Label noErrorLabel = generateLocalLabel();
 
             // evaluate string expression, and save it on stack
             expr.list.dispatch(this);
-            record.upSlot();
             record.pushToStack(A0, "Save string pointer on stack.");
             pushStackSpace("Reserve space for saved string pointer");
 
@@ -1175,8 +1271,7 @@ public class CodeGenImpl extends CodeGenBase {
             expr.index.dispatch(this);
 
             // restore string pointer to A1
-            record.readFromStack(A1, "Retrieve string pointer in A1.");
-            record.downSlot();
+            record.popFromStack(A1, "Retrieve string pointer in A1.");
             popStackSpace("Pop off saved string pointer from stack");
 
             // ensure string pointer is not None
@@ -1205,7 +1300,9 @@ public class CodeGenImpl extends CodeGenBase {
 
         /*----------------------- FOR LOOPS  -----------------------*/
 
-        /** Emit code for looping a list. */
+        /**
+         * Emit code for looping a list.
+         */
         public void emitForList(ForStmt forStmt) {
             /* CAUTION: concatenating to the loop iterable should not
              * have an effect within the loop, so we should not recompute
@@ -1240,13 +1337,9 @@ public class CodeGenImpl extends CodeGenBase {
 
             // save values of T0-T3 registers
             allocateStackSpace(4 * WORD_SIZE, "Reserve space for T0-T3, used by for-list loop");
-            record.upSlot();
             record.pushToStack(T0, "Store the value of T0, used by for-list loop");
-            record.upSlot();
             record.pushToStack(T1, "Store the value of T1, used by for-list loop");
-            record.upSlot();
             record.pushToStack(T2, "Store the value of T2, used by for-list loop");
-            record.upSlot();
             record.pushToStack(T3, "Store the value of T3, used by for-list loop");
 
 
@@ -1256,14 +1349,10 @@ public class CodeGenImpl extends CodeGenBase {
             }
 
             // restore values of T0-T3 registers
-            record.readFromStack(T3, "Restore the value of T3, used by for-list loop");
-            record.downSlot();
-            record.readFromStack(T2, "Restore the value of T2, used by for-list loop");
-            record.downSlot();
-            record.readFromStack(T1, "Restore the value of T1, used by for-list loop");
-            record.downSlot();
-            record.readFromStack(T0, "Restore the value of T0, used by for-list loop");
-            record.downSlot();
+            record.popFromStack(T3, "Restore the value of T3, used by for-list loop");
+            record.popFromStack(T2, "Restore the value of T2, used by for-list loop");
+            record.popFromStack(T1, "Restore the value of T1, used by for-list loop");
+            record.popFromStack(T0, "Restore the value of T0, used by for-list loop");
             deallocateStackSpace(4 * WORD_SIZE, "Pop stack space for T0-T3, used by for-list loop");
 
             // end of one loop iteration
@@ -1280,7 +1369,9 @@ public class CodeGenImpl extends CodeGenBase {
         }
 
 
-        /** Emit code for looping a string. */
+        /**
+         * Emit code for looping a string.
+         */
         public void emitForStr(ForStmt forStmt) {
             /* CAUTION: concatenating to the loop iterable should not
              * have an effect within the loop, so we should not recompute
@@ -1313,13 +1404,9 @@ public class CodeGenImpl extends CodeGenBase {
             // save values of T0-T3 registers
             // we do this BEFORE converting character object, to ensure T0-T3 haven't been modified
             allocateStackSpace(4 * WORD_SIZE, "Reserve space for T0-T3, used by for-str loop");
-            record.upSlot();
             record.pushToStack(T0, "Store the value of T0, used by for-str loop");
-            record.upSlot();
             record.pushToStack(T1, "Store the value of T1, used by for-str loop");
-            record.upSlot();
             record.pushToStack(T2, "Store the value of T2, used by for-str loop");
-            record.upSlot();
             record.pushToStack(T3, "Store the value of T3, used by for-str loop");
 
             // T0: str_length, T1: loop counter, T2: pointer at str, T3: address of control variable
@@ -1340,14 +1427,10 @@ public class CodeGenImpl extends CodeGenBase {
             }
 
             // restore values of T0-T3 registers
-            record.readFromStack(T3, "Restore the value of T3, used by for-str loop");
-            record.downSlot();
-            record.readFromStack(T2, "Restore the value of T2, used by for-str loop");
-            record.downSlot();
-            record.readFromStack(T1, "Restore the value of T1, used by for-str loop");
-            record.downSlot();
-            record.readFromStack(T0, "Restore the value of T0, used by for-str loop");
-            record.downSlot();
+            record.popFromStack(T3, "Restore the value of T3, used by for-str loop");
+            record.popFromStack(T2, "Restore the value of T2, used by for-str loop");
+            record.popFromStack(T1, "Restore the value of T1, used by for-str loop");
+            record.popFromStack(T0, "Restore the value of T0, used by for-str loop");
             deallocateStackSpace(4 * WORD_SIZE, "Pop stack space for T0-T3, used by for-str loop");
 
             // end of one loop iteration
@@ -1370,68 +1453,41 @@ public class CodeGenImpl extends CodeGenBase {
         /*-----------------------------------------------------------*/
 
 
-        /** Emit the address of static link for a calling function CALLEEINFO
-         *  from current function into passed register Rd. */
+        /**
+         * Emit the address of static link for a calling function CALLEEINFO
+         * from current function into passed register Rd.
+         */
         private void emitStaticLink(Register rd, FuncInfo calleeInfo) {
             FuncInfo parentInfo = calleeInfo.getParentFuncInfo();
             FuncInfo curFuncInfo = this.funcInfo;
 
             // static link is initially at current frame
             backend.emitMV(rd, FP, String.format("Get static link to %s",
-                                                 curFuncInfo.getFuncName()));
+                    curFuncInfo.getFuncName()));
 
             // follow static link to find the static link of the enclosing
             // function, for which the callee function is defined
-            while (!curFuncInfo.getFuncName().equals(parentInfo.getFuncName())) {
+            int distance = curFuncInfo.getDepth() - parentInfo.getDepth();
+            while (distance > 0) {
                 String comment =
-                    String.format("Get static link to %s", curFuncInfo.getFuncName());
+                        String.format("Get static link to %s", curFuncInfo.getFuncName());
                 backend.emitLW(rd, rd, this.getStaticLinkOffset(curFuncInfo), comment);
                 curFuncInfo = curFuncInfo.getParentFuncInfo();
+                distance--;
             }
         }
 
         /**
-         * Turn boolean value inside register $A0 to corresponding boolean object.
-         * The caller has to ensure it's indeed a boolean value, and is stored at $A0.
-         * Register $T0 is modified by this call.
+         * Box the value in register A0, based on given EXPRTYPE.
          */
-        private void emitObjectifyBoolean() {
-            Label falseObjectLabel = constants.getBoolConstant(false);
-            backend.emitLA(T0, falseObjectLabel, "Fetch address of False object");
-            backend.emitSLLI(A0, A0, 4, "Get offset of right bool object");
-            backend.emitADD(A0, T0, A0, "Get correct boolean object");
-        }
-
-        /**
-         * Turn integer value inside register $A0 to corresponding integer object.
-         * The caller has to ensure it's indeed a integer value, and is stored at $A0.
-         * Register $T0 is modified by this call.
-         */
-        private void emitObjectifyInteger() {
-            Label intPrototypeLabel = intClass.getPrototypeLabel();
-
-            // save current value in A0 to stack, in case RD = A0
-            record.upSlot();
-            record.pushToStack(A0,
-                    "Save integer value on stack before allocating new object");
-
-            // create integer object and save addr in $A0
-            allocatePrototype(intClass);
-
-            // set attribute __int__
-            record.readFromStack(T0, "Load saved integer value from stack");
-            record.downSlot();
-            backend.emitSW(T0, A0, "@.__int__", "Set attribute: __int__");
-        }
-
-        /** Box the value in register A0, based on given EXPRTYPE. */
         private void emitObjectifyType(SymbolType exprType) {
             if (this.isIntegerType(exprType)) {
-                this.emitObjectifyInteger();
+                backend.emitJAL(boxInt, "Jump to integer boxing routine");
             } else if (this.isBooleanType(exprType)) {
-                this.emitObjectifyBoolean();
+                backend.emitJAL(boxBool, "Jump to boolean boxing routine");
             }
         }
+
 
         /*-----------------------------------------------------------*/
         /*                                                           */
@@ -1440,44 +1496,56 @@ public class CodeGenImpl extends CodeGenBase {
         /*-----------------------------------------------------------*/
 
 
-        /** Return the offset of the static link for function FUNCINFO */
+        /**
+         * Return the offset of the static link for function FUNCINFO
+         */
         private int getStaticLinkOffset(FuncInfo funcInfo) {
             assert !this.isTopLevel(funcInfo)
-                : "No static link for top-level functions";
+                    : "No static link for top-level functions";
             return funcInfo.getParams().size() * WORD_SIZE;
         }
 
-        /** Return true if a function FUNCINFO is a top level function. */
+        /**
+         * Return true if a function FUNCINFO is a top level function.
+         */
         private boolean isTopLevel(FuncInfo funcInfo) {
             return funcInfo == null ||
-                   funcInfo.getParentFuncInfo() == null;
+                    funcInfo.getParentFuncInfo() == null;
         }
 
-        /** Return paramInfo for a given parameter with NAME in FUNCINFO. */
+        /**
+         * Return paramInfo for a given parameter with NAME in FUNCINFO.
+         */
         private StackVarInfo getParamInfo(FuncInfo funcInfo, String name) {
             SymbolInfo symInfo = funcInfo.getSymbolTable().get(name);
             assert symInfo instanceof StackVarInfo
-                : "static analysis should ensure function parameter are variables";
+                    : "static analysis should ensure function parameter are variables";
             return (StackVarInfo) symInfo;
         }
 
-        /** Return true for a given parameter NAME in FUNCINFO is object type.
-         *  This is useful to determine when we should wrap int/bool values. */
+        /**
+         * Return true for a given parameter NAME in FUNCINFO is object type.
+         * This is useful to determine when we should wrap int/bool values.
+         */
         private boolean isObjectParam(FuncInfo funcInfo, String name) {
             StackVarInfo paramInfo = this.getParamInfo(funcInfo, name);
             return paramInfo.getVarType() == null ||
-                   paramInfo.getVarType().className() == null ||
-                   paramInfo.getVarType().className().equals("object");
+                    paramInfo.getVarType().className() == null ||
+                    paramInfo.getVarType().className().equals("object");
         }
 
         /*---------------- SYMBOL TYPE COMPARISON  ------------------*/
 
-        /** Return true if a symbol TYPE is BOOL_TYPE. */
+        /**
+         * Return true if a symbol TYPE is BOOL_TYPE.
+         */
         private boolean isBooleanType(SymbolType type) {
             return BOOL_TYPE.equals(type);
         }
 
-        /** Return true if a symbol TYPE is INT_TYPE. */
+        /**
+         * Return true if a symbol TYPE is INT_TYPE.
+         */
         private boolean isIntegerType(SymbolType type) {
             return INT_TYPE.equals(type);
         }
@@ -1497,10 +1565,6 @@ public class CodeGenImpl extends CodeGenBase {
             return NONE_TYPE.equals(type);
         }
 
-        /*** Return true if a symbol TYPE is EMPTY_TYPE. */
-        private boolean isEmptyType(SymbolType type) {
-            return EMPTY_TYPE.equals(type);
-        }
     }
 
     /**
@@ -1523,8 +1587,7 @@ public class CodeGenImpl extends CodeGenBase {
      * of bounds, and division by zero. They never return to their caller.
      * Just jump to one of these routines to throw an error and
      * exit the program. For example, to throw an OOB error:
-     *   backend.emitJ(errorOob, "Go to out-of-bounds error and abort");
-     *
+     * backend.emitJ(errorOob, "Go to out-of-bounds error and abort");
      */
     protected void emitCustomCode() {
         emitErrorFunc(errorArg, ERROR_ARG, "Bad argument.");
@@ -1535,414 +1598,42 @@ public class CodeGenImpl extends CodeGenBase {
         emitErrorFunc(errorOom, ERROR_OOM, "Out of memory");
         emitErrorFunc(errorNyi, ERROR_NYI, "Unimplemented operation");
 
-        emitListRoutine();
-        emitStringRoutine();
+        // custom list routines
+        emitStdFunc(constlistLabel, CUSTOM_LIBRARY_CODE_DIR);
+        emitStdFunc(listconcatLabel, CUSTOM_LIBRARY_CODE_DIR);
+
+        // string routines
+        emitStdFunc(streqLabel, CUSTOM_LIBRARY_CODE_DIR);
+        emitStdFunc(strcatLabel, CUSTOM_LIBRARY_CODE_DIR);
+        emitStdFunc(charInitLabel, CUSTOM_LIBRARY_CODE_DIR);
+
+        // character data
+        backend.startData(); // start data region
+        backend.alignNext(2); // align address to multiple of 2*2 = 4
+        backend.emitGlobalLabel(allChars);
+        backend.emitInsn(
+                String.format(".space %d", ONE_CHAR_STR_OBJECT_SIZE * MAX_CHAR_DECIMAL),
+                "Allocate enough space for all one-character string objects"
+        );
+        backend.startCode(); // restart code region
+
+        // special value boxing routines
+        emitStdFunc(boxInt, CUSTOM_LIBRARY_CODE_DIR);
+        emitStdFunc(boxBool, CUSTOM_LIBRARY_CODE_DIR);
+        emitStdFunc(nobox, CUSTOM_LIBRARY_CODE_DIR);
     }
 
-    /** Emit an error routine labeled ERRLABEL that aborts with message MSG. */
+    /**
+     * Emit an error routine labeled ERRLABEL that aborts with message MSG.
+     */
     private void emitErrorFunc(Label errLabel, int errorCode, String msg) {
         backend.emitGlobalLabel(errLabel);
         backend.emitLI(A0, errorCode, "Exit code for: " + msg);
         backend.emitLA(A1, constants.getStrConstant(msg),
-                       "Load error message as str");
+                "Load error message as str");
         backend.emitADDI(A1, A1, getAttrOffset(strClass, "__str__"),
-                         "Load address of attribute __str__");
+                "Load address of attribute __str__");
         backend.emitJ(abortLabel, "Abort");
-    }
-
-    /*-----------------------------------------------------------*/
-    /*                                                           */
-    /*                LIST ROUTINE CODE GENERATION               */
-    /*                                                           */
-    /*-----------------------------------------------------------*/
-
-    /** Emit custom routines for list operations. */
-    private void emitListRoutine() {
-        // list construction
-        emitListConstruction();
-        // list concatenation
-        emitListConcatenation();
-    }
-
-    /**
-     * Emit list construction code routine.
-     *
-     * This routine behaves as a function.
-     * To construct a list of N elements, N+1 parameters are passed
-     * as arguments. The first N arguments are the list values, and
-     * the last argument is the number of elements in the list.
-     *
-     * Register A0, A1, T0, T1, T2, T3 are modified in the routine.
-     */
-    private void emitListConstruction() {
-        Label initLabel = new Label("conslist_initialization");
-        Label endLabel = new Label("conslist_done");
-        Label prototypeLabel = listClass.getPrototypeLabel();
-
-        backend.emitGlobalLabel(constlistLabel);
-        emitFunctionPrologue();
-
-        // load information for list
-        backend.emitLA(A0, prototypeLabel, "Load address to list prototype");
-        backend.emitLW(A1, FP, 0, "Load list length");
-
-        // allocate list object
-        backend.emitBEQZ(A1, endLabel, "Empty list can use list prototype");
-        backend.emitADDI(A1, A1, "@.__list_header_words__",
-                                 "Total words needed for list object");
-        backend.emitJAL(objectAllocResizeLabel, "allocate list object");
-
-        // set length attribute
-        backend.emitLW(T0, FP, 0, "Load list length");
-        backend.emitSW(T0, A0, "@.__len__", "set __len__ attribute");
-
-        // initialize pointers to list elements
-        backend.emitSLLI(T1, T0, 2, "List length in bytes");
-        backend.emitADD(T1, T1, FP, "Set T1 to address of first argument");
-        backend.emitADDI(T2, A0, "@.__elts__", "Set T2 to first list item in list object");
-
-        // set list elements
-        backend.emitLocalLabel(initLabel, "Initialize list items");
-        backend.emitLW(T3, T1, 0, "Read current list item from function arguments");
-        backend.emitSW(T3, T2, 0, "Set current list item in list object");
-
-        backend.emitADDI(T1, T1, -WORD_SIZE, "Point T1 to address of next argument");
-        backend.emitADDI(T2, T2, WORD_SIZE, "Point T2 to address of next list item in list object");
-        backend.emitADDI(T0, T0, -1, "Reduce counter: one less list item to initialize.");
-        backend.emitBNEZ(T0, initLabel, "If counter != 0, continue list initialization.");
-
-        // done
-        backend.emitLocalLabel(endLabel, "List initialization done.");
-        emitFunctionEpilogue();
-        backend.emitJR(RA, "Return to caller");
-    }
-
-    /**
-     * Emit list concatenation code routine.
-     *
-     * This routine behaves as a function.
-     * To concatenate two lists, 2 arguments are passed, each being
-     * the address of the two lists.
-     *
-     * Register A0, A1, T0, T1, T2, T3 are modified in the routine.
-     */
-    private void emitListConcatenation() {
-        Label initLabel1 = new Label("concat_init_list_1");
-        Label initLabel2 = new Label("concat_init_list_2");
-        Label initPointer = new Label("concat_init_list_2_pointer");
-        Label errorLabel = new Label("concat_none_error");
-        Label endLabel = new Label("concat_done");
-        Label prototypeLabel = listClass.getPrototypeLabel();
-
-        backend.emitGlobalLabel(listconcatLabel);
-        emitFunctionPrologue();
-
-        // load pointers to lists
-        backend.emitLW(A0, FP, 4, "Load pointer to first list");
-        backend.emitLW(A1, FP, 0, "Load pointer to second list");
-
-        // check against None
-        backend.emitBEQZ(A0, errorLabel, "Check first list is not None");
-        backend.emitBEQZ(A1, errorLabel, "Check second list is not None");
-
-        // calculate length of concatenated list
-        backend.emitLW(T0, A0, "@.__len__", "Load length of first list");
-        backend.emitLW(T1, A1, "@.__len__", "Load length of second list");
-        backend.emitADD(T2, T0, T1, "Calculate length of concatenated list");
-
-        // save total length on stack
-        record.upSlot();
-        pushStackSpace("Reserve stack space for total length");
-        record.pushToStack(T2, "Save total length of concatenated list on stack");
-
-        // construct object for the concatenated list, save pointer in A0
-        backend.emitLA(A0, prototypeLabel, "Load address to list prototype");
-        backend.emitADDI(A1, T2, "@.__list_header_words__",
-                                 "Total words needed for list object");
-        backend.emitJAL(objectAllocResizeLabel, "Allocate new list object");
-
-        // retrieve total length, save in A1
-        record.readFromStack(A1, "Retrieve total length of concatenated list");
-        record.downSlot();
-        popStackSpace("Pop total length of concatenated list off stack");
-
-        // set length attribute
-        backend.emitSW(A1, A0, "@.__len__", "set __len__ attribute");
-
-        // initialize pointers for appending elements of first list
-        backend.emitADDI(T0, A0, "@.__elts__",
-                                 "Point T0 to the fist element in concatenated list object");
-        backend.emitLW(T1, FP, 4, "Load pointer to first list");
-        backend.emitLW(T2, T1, "@.__len__", "Load length of first list");
-        backend.emitADDI(T1, T1, "@.__elts__",
-                                  "Point T1 to the first element of first list");
-
-        // append elements of first list
-        backend.emitLocalLabel(initLabel1, "Append list items of first list");
-        backend.emitBEQZ(T2, initPointer, "No need to append elements if first list is empty");
-        backend.emitLW(T3, T1, 0, "Read current list item from first list");
-        backend.emitSW(T3, T0, 0, "Set current list item in concatenated list object");
-        backend.emitADDI(T0, T0, WORD_SIZE, "Point T0 to next list item in concatenated list");
-        backend.emitADDI(T1, T1, WORD_SIZE, "Point T1 to next list item in first list");
-        backend.emitADDI(T2, T2, -1, "Reduce counter: one less list item to append.");
-        backend.emitBNEZ(T2, initLabel1,
-                         "If counter != 0, continue appending elements of first list.");
-
-        // initialize pointers for appending elements of second list
-        backend.emitLocalLabel(initPointer, "Prepare for appending elements of second list");
-        backend.emitLW(T1, FP, 0, "Load pointer to second list");
-        backend.emitLW(T2, T1, "@.__len__", "Load length of second list");
-        backend.emitADDI(T1, T1, "@.__elts__",
-                                  "Point T1 to the first element of second list");
-
-        // append elements of second list
-        backend.emitLocalLabel(initLabel2, "Append list items of second list");
-        backend.emitBEQZ(T2, endLabel, "No need to append elements if second list is empty");
-        backend.emitLW(T3, T1, 0, "Read current list item from second list");
-        backend.emitSW(T3, T0, 0, "Set current list item in concatenated list object");
-        backend.emitADDI(T0, T0, WORD_SIZE, "Point T0 to next list item in concatenated list");
-        backend.emitADDI(T1, T1, WORD_SIZE, "Point T1 to next list item in second list");
-        backend.emitADDI(T2, T2, -1, "Reduce counter: one less list item to append.");
-        backend.emitBNEZ(T2, initLabel2,
-                         "If counter != 0, continue appending elements of second list.");
-
-        // done, if no error
-        backend.emitLocalLabel(endLabel, "List concatenation done.");
-        emitFunctionEpilogue();
-        backend.emitJR(RA, "Return to caller");
-
-        // Operation on None error
-        backend.emitLocalLabel(errorLabel, "Error: at least one list is None");
-        backend.emitJ(errorNone, "Throw Operation on None error");
-    }
-
-    /*-----------------------------------------------------------*/
-    /*                                                           */
-    /*              STRING ROUTINE CODE GENERATION               */
-    /*                                                           */
-    /*-----------------------------------------------------------*/
-
-    /** Emit custom routines for string operations. */
-    private void emitStringRoutine() {
-        // initialize one character strings
-        emitInitializeCharacters();
-        // string concatenation
-        emitStringConcatenation();
-        // string comparison
-        emitStringComparison();
-    }
-
-    /** Emit code for string comparison. */
-    private void emitStringConcatenation() {
-        Label endLabel = new Label("strcat_end");
-        Label errorLabel = new Label("strcat_none_error");
-        Label returnFirst = new Label("strcat_return_first");
-        Label returnSecond = new Label("strcat_return_second");
-        Label addNull = new Label("strcat_add_null");
-        Label appendFirst = new Label("strcat_append_first");
-        Label appendSecond = new Label("strcat_append_second");
-        Label resetPointer = new Label("strcat_reset_pointer");
-        Label prototypeLabel = strClass.getPrototypeLabel();
-
-        backend.emitGlobalLabel(strcatLabel);
-        emitFunctionPrologue();
-
-        // load pointers to strings
-        backend.emitLW(T0, FP, 4, "Load pointer to first string");
-        backend.emitLW(T1, FP, 0, "Load pointer to second string");
-
-        // check against None
-        backend.emitBEQZ(T0, errorLabel, "Check first string is not None");
-        backend.emitBEQZ(T1, errorLabel, "Check second string is not None");
-
-        // special case management
-        backend.emitLW(T0, T0, "@.__len__", "Load length of first string");
-        backend.emitBEQZ(T0, returnSecond, "Return str_2, if str_1 is empty");
-        backend.emitLW(T1, T1, "@.__len__", "Load length of second string");
-        backend.emitBEQZ(T1, returnFirst, "Return str_1, if str_2 is empty");
-
-        // calculate total length (in bytes, exclude null), and save on stack
-        backend.emitADD(T1, T0, T1, "Calculate total length of concatenated string");
-        record.upSlot();
-        pushStackSpace("Reserve stack space for total length");
-        record.pushToStack(T1, "Save total length of concatenated string on stack");
-
-        // allocate new string object
-        backend.emitADDI(T1, T1, 4, "Add 4 for ceiling operation");
-        backend.emitSRLI(T1, T1, 2, "Convert length from bytes to words");
-        backend.emitADDI(A1, T1, "@.__string_header_words__", "Add header size");
-        backend.emitLA(A0, prototypeLabel, "Load prototype to string object");
-        backend.emitJAL(objectAllocResizeLabel, "Allocate new string object");
-
-        // retrieve total length (in bytes, exclude null) from stack
-        record.readFromStack(T0, "Retrieve total length of concatenated string");
-        record.downSlot();
-        popStackSpace("Pop total length of concatenated string off stack");
-
-        // set length attribute
-        backend.emitSW(T0, A0, "@.__len__", "Set attribute: __len__");
-
-        // initialize pointers for appending contents of first string
-        backend.emitADDI(T2, A0, "@.__str__", "Point T2 at first byte in new string");
-        backend.emitLW(T0, FP, 4, "Point T0 at first string");
-        backend.emitLW(T1, T0, "@.__len__", "Load length of first string, in bytes");
-        backend.emitADDI(T0, T0, "@.__str__", "Point T0 at first byte in first string");
-
-        // append contents of first string
-        backend.emitLocalLabel(appendFirst, "Append bytes of first string");
-        backend.emitBEQZ(T1, resetPointer, "Done appending first string, if counter == 0");
-        backend.emitLBU(T3, T0, 0, "Load current byte from first string");
-        backend.emitSB(T3, T2, 0, "Save current byte to new string");
-        backend.emitADDI(T1, T1, -1, "Reduce counter: one less byte to append");
-        backend.emitADDI(T0, T0, 1, "Point T0 at next byte in first string");
-        backend.emitADDI(T2, T2, 1, "Point T2 at next byte in new string");
-        backend.emitJ(appendFirst, "Continue appending contents of first string");
-
-        // initialize pointers for appending contents of second string
-        backend.emitLocalLabel(resetPointer, "Prepare pointers for appending second string");
-        backend.emitLW(T0, FP, 0, "Point T0 at second string");
-        backend.emitLW(T1, T0, "@.__len__", "Load length of second string, in bytes");
-        backend.emitADDI(T0, T0, "@.__str__", "Point T0 at first byte in second string");
-
-        // append contents of second string
-        backend.emitLocalLabel(appendSecond, "Prepare pointers for appending second string");
-        backend.emitBEQZ(T1, addNull, "Done appending second string, if counter == 0");
-        backend.emitLBU(T3, T0, 0, "Load current byte from second string");
-        backend.emitSB(T3, T2, 0, "Save current byte to new string");
-        backend.emitADDI(T1, T1, -1, "Reduce counter: one less byte to append");
-        backend.emitADDI(T0, T0, 1, "Point T0 at next byte in second string");
-        backend.emitADDI(T2, T2, 1, "Point T2 at next byte in new string");
-        backend.emitJ(appendSecond, "Continue appending contents of second string");
-
-        // special case: return string 1
-        backend.emitLocalLabel(returnFirst, "special case: return first string");
-        backend.emitLW(A0, FP, 4, "Load pointer to first string");
-        backend.emitJ(endLabel, "Go to end function epilogue");
-
-        // special case: return string 2
-        backend.emitLocalLabel(returnSecond, "special case: return second string");
-        backend.emitLW(A0, FP, 0, "Load pointer to second string");
-        backend.emitJ(endLabel, "Go to end function epilogue");
-
-        // add null byte
-        backend.emitLocalLabel(addNull, null);
-        backend.emitSB(ZERO, T2, 0, "Append null byte to new string");
-
-        // done, if no error
-        backend.emitLocalLabel(endLabel, "string concatenation done.");
-        emitFunctionEpilogue();
-        backend.emitJR(RA, "Return to caller");
-
-        // Operation on None error
-        backend.emitLocalLabel(errorLabel, "Error: at least one string is None");
-        backend.emitJ(errorNone, "Throw Operation on None error");
-    }
-
-    /**
-     * Emit string comparison check code.
-     *
-     * This routine behaves as a function.
-     * To compare two strings, 2 arguments are passed, each being
-     * the address of the two strings. A0 is 1 if strings are equal.
-     *
-     * Register A0, A1, T0, T1, T2, T3, T4 are modified in the routine.
-     */
-    private void emitStringComparison() {
-        Label notEqualLabel = new Label("streql_not_equal");
-        Label byteCompareLabel = new Label("streql_byte_compare");
-        Label errorLabel = new Label("streql_none");
-        Label endLabel = new Label("streql_done");
-
-        backend.emitGlobalLabel(streqLabel);
-        emitFunctionPrologue();
-
-        // load strings
-        backend.emitLW(A0, FP, 4, "Load pointer to first string");
-        backend.emitLW(A1, FP, 0, "Load pointer to second string");
-
-        // check against None
-        backend.emitBEQZ(A0, errorLabel, "Check first string is not None");
-        backend.emitBEQZ(A1, errorLabel, "Check second string is not None");
-
-        // calculate string length
-        backend.emitLW(T0, A0, "@.__len__", "Load length of first string");
-        backend.emitLW(T1, A1, "@.__len__", "Load length of second string");
-
-        // two strings are not equal, if they differ by length
-        backend.emitBNE(T0, T1, notEqualLabel, "str1 != str2, if they differ in length");
-
-        // prepare pointers for byte comparison
-        backend.emitADDI(T1, A0, "@.__str__", "Point T1 at first byte of first string");
-        backend.emitADDI(T2, A1, "@.__str__", "Point T2 at first byte of second string");
-
-        // compare strings byte by byte
-        backend.emitLocalLabel(byteCompareLabel, "Compare byte by byte");
-        backend.emitLBU(T3, T1, 0, "Load current byte of first string");
-        backend.emitLBU(T4, T2, 0, "Load current byte of second string");
-        backend.emitBNE(T3, T4, notEqualLabel, "str1 != str2, if one byte is different");
-        backend.emitADDI(T1, T1, 1, "Point T1 at next byte of first string");
-        backend.emitADDI(T2, T2, 1, "Point T2 at next byte of second string");
-        backend.emitADDI(T0, T0, -1, "Reduce counter: one less to compare");
-        backend.emitBGTZ(T0, byteCompareLabel,  "If counter != 0, continue byte comparison.");
-        backend.emitLI(A0, 1, "Load true literal");
-        backend.emitJ(endLabel, "str1 == str2");
-
-        // string is not equal
-        backend.emitLocalLabel(notEqualLabel, "str1 != str2");
-        backend.emitMV(A0, ZERO, "load false literal");
-
-        // done
-        backend.emitLocalLabel(endLabel, "String comparison done");
-        emitFunctionEpilogue();
-        backend.emitJR(RA, "Return to caller");
-
-        // Operation on None error
-        backend.emitLocalLabel(errorLabel, "Error: at least one string is None");
-        backend.emitJ(errorNone, "Throw Operation on None error");
-    }
-
-    /** Initialize one-character strings, using the routine in reference. */
-    private void emitInitializeCharacters() {
-        Label prototypeLabel = strClass.getPrototypeLabel();
-        Label initSingleChar = generateLocalLabel();
-
-
-        // code to initialize one-character strings
-        backend.emitGlobalLabel(charInitLabel);
-
-        backend.emitLA(A0, prototypeLabel, "Load prototype to string object");
-        backend.emitLW(T0, A0, 0 * WORD_SIZE,"Load type tag");
-        backend.emitLW(T1, A0, 1 * WORD_SIZE ,"Load size in words");
-        backend.emitLW(T2, A0, 2 * WORD_SIZE ,"Load pointer to dispatch table");
-        backend.emitLI(T3, 1, "Load attribute __len__ for one-character string");
-
-        backend.emitLA(A0, allChars, "Load address to data table: allChars");
-        backend.emitLI(T4, MAX_CHAR_DECIMAL, "load max character decimal value");
-        backend.emitMV(T5, ZERO, "Initialize counter to 0");
-
-        backend.emitLocalLabel(initSingleChar, "Initialize single character string");
-        backend.emitSW(T0, A0, 0 * WORD_SIZE, "Set type tag");
-        backend.emitSW(T1, A0, 1 * WORD_SIZE ,"Set size in words");
-        backend.emitSW(T2, A0, 2 * WORD_SIZE ,"Set pointer to dispatch table");
-        backend.emitSW(T3, A0, 3 * WORD_SIZE ,"Set __len__ attribute");
-        backend.emitSW(T5, A0, 4 * WORD_SIZE ,"Set character value");
-        backend.emitADDI(A0, A0, ONE_CHAR_STR_OBJECT_SIZE, "Move pointer to next free space");
-        backend.emitADDI(T5, T5, 1, "Increment counter");
-        backend.emitBNE(T4, T5, initSingleChar, "Continue initializing, if counter <= max char");
-
-        // done initializing one-character strings
-        backend.emitJR(RA, "Return to caller");
-
-        // start data table for one-character strings
-        backend.startData();
-        backend.alignNext(2); // align address to multiple of 2*2 = 4
-        backend.emitGlobalLabel(allChars);
-        backend.emitInsn(String.format(".space %d", ONE_CHAR_STR_OBJECT_SIZE * MAX_CHAR_DECIMAL),
-                         "Allocate enough space for all one-character string objects");
-
-        // restart code region
-        backend.startCode();
-
     }
 
 
@@ -1955,18 +1646,21 @@ public class CodeGenImpl extends CodeGenBase {
 
     /*------------------------ FUNCTIONS  -------------------------*/
 
-    /** Emit code for function prologues */
+    /**
+     * Emit code for function prologues
+     */
     private void emitFunctionPrologue() {
         backend.emitADDI(SP, SP, -2 * WORD_SIZE,
-                         "Reserve space for caller's return addr, control link");
+                "Reserve space for caller's return addr, control link");
         backend.emitSW(FP, SP, 0, "saved caller's dynamic link");
         backend.emitSW(RA, SP, WORD_SIZE, "saved caller's return addr");
-        backend.emitADDI(FP, SP, 2 *WORD_SIZE, "New FP is at old SP");
+        backend.emitADDI(FP, SP, 2 * WORD_SIZE, "New FP is at old SP");
+        record.upSlot(2);
     }
 
     /**
-     *  Emit code for function epilogue, with function full-qualified FUNCNAME
-     *  and function activation record of SIZE bytes.
+     * Emit code for function epilogue, with function full-qualified FUNCNAME
+     * and function activation record of SIZE bytes.
      */
     private void emitFunctionEpilogue() {
         backend.emitLW(RA, FP, -1 * WORD_SIZE, "Get return address");
@@ -1975,8 +1669,10 @@ public class CodeGenImpl extends CodeGenBase {
         backend.emitMV(SP, T0, "Restore old stack pointer");
     }
 
-    /** Return the offset with respect to FUNCINFO's own FP,
-     *  for retrieving local variables/parameters of NAME. */
+    /**
+     * Return the offset with respect to FUNCINFO's own FP,
+     * for retrieving local variables/parameters of NAME.
+     */
     private int getVarOffset(FuncInfo funcInfo, String name) {
         int varIndex = funcInfo.getVarIndex(name);
         int paramSize = funcInfo.getParams().size();
@@ -1987,45 +1683,59 @@ public class CodeGenImpl extends CodeGenBase {
 
     /*------------------------ STACK SPACE  -------------------------*/
 
-    /** Explicitly allocate one slot of space on stack frame. */
+    /**
+     * Explicitly allocate one slot of space on stack frame.
+     */
     private void pushStackSpace() {
         this.allocateStackSpace(WORD_SIZE, "Reserve one slot on stack");
     }
 
-    /** Explicitly deallocate one slot of space on stack frame. */
+    /**
+     * Explicitly deallocate one slot of space on stack frame.
+     */
     private void popStackSpace() {
         this.deallocateStackSpace(WORD_SIZE, "Pop one slot from stack");
     }
 
-    /** Equivalent to calling `pushStackSpace` with custom comment. */
+    /**
+     * Equivalent to calling `pushStackSpace` with custom comment.
+     */
     private void pushStackSpace(String comment) {
         this.allocateStackSpace(WORD_SIZE, comment);
     }
 
-    /** Equivalent to calling `popStackSpace` with custom comment. */
+    /**
+     * Equivalent to calling `popStackSpace` with custom comment.
+     */
     private void popStackSpace(String comment) {
         this.deallocateStackSpace(WORD_SIZE, comment);
     }
 
-    /** Equivalent of calling `allocateStackSpace` with default comment. */
+    /**
+     * Equivalent of calling `allocateStackSpace` with default comment.
+     */
     private void allocateStackSpace(int size) {
-        String comment = String.format("Reserve %d bytes on stack", size);
-        this.allocateStackSpace(size, comment);
+        this.allocateStackSpace(size, String.format("Reserve %d bytes on stack", size));
     }
 
-    /** Equivalent of calling `deallocateStackSpace` with default comment. */
+    /**
+     * Equivalent of calling `deallocateStackSpace` with default comment.
+     */
     private void deallocateStackSpace(int size) {
-        String comment = String.format("Pop %d bytes from stack", size);
-        this.deallocateStackSpace(size, comment);
+        this.deallocateStackSpace(size, String.format("Pop %d bytes from stack", size));
     }
 
-    /** Explicitly reserve space on stack frame. */
+    /**
+     * Explicitly reserve space on stack frame.
+     */
     private void allocateStackSpace(int size, String comment) {
         assert size > 0 : "this method can only be called with positive size";
         backend.emitADDI(SP, SP, -size, comment);
     }
 
-    /** Explicitly deallocate space on stack frame. */
+    /**
+     * Explicitly deallocate space on stack frame.
+     */
     private void deallocateStackSpace(int size, String comment) {
         assert size > 0 : "this method can only be called with positive size";
         backend.emitADDI(SP, SP, size, comment);
@@ -2039,7 +1749,7 @@ public class CodeGenImpl extends CodeGenBase {
     private void allocatePrototype(ClassInfo classInfo) {
         Label prototypeLabel = classInfo.getPrototypeLabel();
         String comment = String.format(
-            "Load pointer to prototype of: %s", classInfo.getClassName()
+                "Load pointer to prototype of: %s", classInfo.getClassName()
         );
 
         backend.emitLA(A0, prototypeLabel, comment);
@@ -2048,7 +1758,9 @@ public class CodeGenImpl extends CodeGenBase {
 
     /*------------------------ LITERALS  -------------------------*/
 
-    /** Load unwrapped (if possible) value of a LITERAL to register RD. */
+    /**
+     * Load unwrapped (if possible) value of a LITERAL to register RD.
+     */
     private void emitLoadLiteral(Register rd, Literal literal) {
         if (literal instanceof IntegerLiteral) {
             int intValue = ((IntegerLiteral) literal).value;

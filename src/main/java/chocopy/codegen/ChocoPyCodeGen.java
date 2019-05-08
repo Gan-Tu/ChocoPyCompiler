@@ -4,7 +4,9 @@ import chocopy.common.astnodes.Program;
 import chocopy.common.codegen.CodeGenBase;
 import chocopy.common.codegen.RiscVBackend;
 
-/** Interface to code generator. */
+/**
+ * Interface to code generator.
+ */
 public class ChocoPyCodeGen {
 
     /**
@@ -24,7 +26,7 @@ public class ChocoPyCodeGen {
             return backend.toString();
         } catch (IllegalStateException | IllegalArgumentException e) {
             System.err.println("Error performing code generation. "
-                               + "Re-run with --debug to see stack trace.");
+                    + "Re-run with --debug to see stack trace.");
             if (debug) {
                 e.printStackTrace();
             }
